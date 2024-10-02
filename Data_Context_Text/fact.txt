@@ -1,0 +1,310 @@
+
+### Fact Tables and SQL Queries Documentation
+
+This document outlines the structure and purpose of several fact tables used in the data warehouse and provides example SQL queries to extract meaningful insights.
+
+#### Table: `fact_sessions`
+
+**Description:**
+An event is recorded each time a player logs into the game, creating a session. The event contains connection details, source information, and user login details.
+
+**Primary Key:** `session_id`
+
+```sql
+CREATE TABLE fact_sessions
+(
+    session_creation_ts timestamp NOT NULL,
+    user_id varchar(100),
+    session_id varchar(256),
+    platform varchar(100),
+    app_version varchar(100),
+    client_type varchar(100),
+    client_language varchar(100),
+    container_type varchar(100),
+    ip_country varchar(100),
+    time_zone varchar(100),
+    previous_login_ts timestamp
+);
+```
+
+#### Table: `fact_rewards`
+
+**Description:**
+This table contains data about rewards given to users. Rewards can be given during various events, as specified in the `event_type` field.
+
+**Primary Key:** `reward_request_id`
+
+```sql
+CREATE TABLE fact_rewards
+(
+    event_ts timestamp,
+    user_id varchar(100),
+    session_id varchar(300),
+    segment_id int,
+    bundle_id int,
+    sku_id int,
+    amount int,
+    event_type varchar(200),
+    reward_request_id varchar(200),
+    transaction_id int
+);
+```
+
+#### Table: `fact_balance`
+
+**Description:**
+An event is recorded whenever the balance of a user's items changes.
+
+```sql
+CREATE TABLE fact_balance 
+(
+    event_ts timestamp,
+    user_id varchar(100),
+    received_item_id varchar(100),
+    current_item_balance int,
+    received_item_quantity int,
+    source_type varchar(100),
+    source_id varchar(100),
+    source_trigger varchar(100),
+    correlation_id varchar(200)
+);
+```
+
+**Note:**
+- `fact_balance` can be joined with `fact_rewards` on `fact_balance.correlation_id = fact_rewards.reward_request_id`. 
+- While `reward_request_id` is the key in `fact_rewards`, `correlation_id` is not unique in `fact_balance` (e.g., a bundle reward can affect multiple items).
+- Balance changes can also occur from other actions (e.g., purchases), so `correlation_id` can be null.
+
+#### Table: `fact_purchases`
+
+**Description:**
+An event is recorded when a user makes a purchase with real money.
+
+**Primary Key:** `transaction_id`
+
+```sql
+CREATE TABLE fact_purchases
+(
+    event_ts timestamp NOT NULL,
+    user_id varchar(100),
+    transaction_id varchar(256),
+    price_usd numeric(18,3),
+    currency varchar(256),
+    platform varchar(100),
+    session_id varchar(300),
+    transaction_source_id int,
+    segment_id int,
+    payment_quantity int,
+    transaction_amount numeric(18,3),
+    sku_id int,
+    is_ftd boolean
+);
+```
+
+#### Table: `fact_install`
+
+**Description:**
+An event is recorded when a user installs the app for the first time on a new platform. The user can appear multiple times if they install the app on different platforms (e.g., Android, iOS, web).
+
+```sql
+CREATE TABLE fact_install
+(
+    user_id varchar(100),
+    install_ts timestamp,
+    install_version varchar(100),
+    platform varchar(100)
+);
+```
+
+#### Example Queries
+
+1. **Join `fact_sessions` and `fact_rewards` to find rewards given during a session:**
+    ```sql
+    SELECT 
+        s.session_id,
+        s.user_id,
+        s.platform,
+        r.event_type,
+        r.amount
+    FROM fact_sessions s
+    JOIN fact_rewards r ON s.session_id = r.session_id
+    WHERE s.user_id = r.user_id;
+    ```
+
+2. **Aggregate the total rewards given per user, grouped by event type:**
+    ```sql
+    SELECT 
+        user_id,
+        event_type,
+        COUNT(*) AS number_of_rewards,
+        SUM(amount) AS total_amount
+    FROM fact_rewards
+    GROUP BY user_id, event_type;
+    ```
+
+3. **Link `fact_balance` and `fact_rewards` to show how rewards affect item balances:**
+    ```sql
+    SELECT 
+        b.event_ts,
+        b.user_id,
+        b.received_item_id,
+        b.current_item_balance,
+        b.received_item_quantity,
+        r.event_type,
+        r.amount
+    FROM fact_balance b
+    JOIN fact_rewards r ON b.correlation_id = r.reward_request_id
+    WHERE b.user_id = r.user_id;
+    ```
+
+4. **Join `fact_rewards` and `fact_purchases` to examine in-game purchases triggered by rewards:**
+    ```sql
+    SELECT 
+        p.user_id,
+        p.transaction_id,
+        p.price_usd,
+        p.platform,
+        p.sku_id,
+        r.event_type,
+        r.amount
+    FROM fact_purchases p
+    JOIN fact_rewards r ON p.transaction_id = r.transaction_id
+    WHERE p.user_id = r.user_id;
+    ```
+
+5. **Analyze user installations and their subsequent session activities:**
+    ```sql
+    SELECT 
+        i.user_id,
+        i.install_ts,
+        i.install_version,
+        i.platform,
+        s.session_creation_ts,
+        s.app_version
+    FROM fact_install i
+    LEFT JOIN fact_sessions s ON i.user_id = s.user_id AND i.platform = s.platform
+    WHERE s.session_creation_ts > i.install_ts;
+    ```
+
+6. **Query to map `sku_id` to `received_item_id` using the rewards and balance tables:**
+    ```sql
+    SELECT DISTINCT
+        r.sku_id,
+        b.received_item_id
+    FROM fact_rewards r
+    JOIN fact_balance b ON r.reward_request_id = b.correlation_id
+    WHERE r.sku_id IS NOT NULL AND b.received_item_id IS NOT NULL;
+    ```
+
+7. **Analyze first-time depositors and their subsequent session activities:**
+    ```sql
+    WITH FirstTimeDepositors AS (
+        SELECT 
+            user_id,
+            MIN(event_ts) AS first_purchase_time
+        FROM fact_purchases
+        WHERE is_ftd = TRUE
+        GROUP BY user_id
+    )
+    SELECT 
+        f.user_id,
+        f.first_purchase_time,
+        s.session_creation_ts,
+        s.platform,
+        s.client_type
+    FROM FirstTimeDepositors f
+    JOIN fact_sessions s ON f.user_id = s.user_id
+    WHERE s.session_creation_ts > f.first_purchase_time;
+    ```
+
+#### Key Metrics Queries
+
+1. **ARPU (Average Revenue Per User):**
+    ```sql
+    SELECT 
+        AVG(total_revenue) AS ARPU
+    FROM (
+        SELECT 
+            user_id,
+            SUM(price_usd) AS total_revenue
+        FROM fact_purchases
+        GROUP BY user_id
+    ) AS user_revenue;
+    ```
+
+2. **ARPPU (Average Revenue Per Paying User):**
+    ```sql
+    SELECT 
+        AVG(total_revenue) AS ARPPU
+    FROM (
+        SELECT 
+            user_id,
+            SUM(price_usd) AS total_revenue
+        FROM fact_purchases
+        GROUP BY user_id
+        HAVING total_revenue > 0
+    ) AS paying_user_revenue;
+    ```
+
+3. **LTV (Lifetime Value):**
+    ```sql
+    SELECT 
+        AVG(total_revenue) AS LTV
+    FROM (
+        SELECT 
+            user_id,
+            SUM(price_usd) AS total_revenue
+        FROM fact_purchases
+        GROUP BY user_id
+    ) AS user_revenue;
+    ```
+
+4. **Retention Rate:**
+    ```sql
+    WITH UserActivity AS (
+        SELECT 
+            user_id,
+            MIN(session_creation_ts) AS first_active,
+            MAX(session_creation_ts) AS last_active
+        FROM fact_sessions
+        GROUP BY user_id
+    )
+    SELECT 
+        COUNT(*) FILTER (WHERE last_active > '2023-01-01') * 100.0 / COUNT(*) AS Retention_Rate
+    FROM UserActivity
+    WHERE first_active < '2023-01-01';
+    ```
+
+5. **Churn Rate:**
+    ```sql
+    WITH UserActivity AS (
+        SELECT 
+            user_id,
+            MIN(session_creation_ts) AS first_active,
+            MAX(session_creation_ts) AS last_active
+        FROM fact_sessions
+        GROUP BY user_id
+    )
+    SELECT 
+        (1 - COUNT(*) FILTER (WHERE last_active > '2023-01-01') * 1.0 / COUNT(*)) * 100 AS Churn_Rate
+    FROM UserActivity
+    WHERE first_active < '2023-01-01';
+    ```
+
+6. **Conversion Rate:**
+    ```sql
+    WITH Installations AS (
+        SELECT 
+            user_id
+        FROM fact_install
+    ),
+    Purchasers AS (
+        SELECT 
+            DISTINCT user_id
+        FROM fact_purchases
+    )
+    SELECT 
+        COUNT(DISTINCT p.user_id) * 100.0 / COUNT(DISTINCT i.user_id) AS Conversion_Rate
+    FROM Installations i
+    JOIN Purchasers p ON i.user_id = p.user_id;
+    ```
